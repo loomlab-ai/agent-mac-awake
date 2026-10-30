@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template LaunchAgent for agent-mac-awake.
+  install via: agent-awake install
+  ProgramArguments[0] MUST be the installed script path, e.g.
+    ~/Library/Application Support/agent-mac-awake/bin/agent-awake
+  The install command rewrites this path for your home directory.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.lofisu.agent-awake</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/REPLACE_ME/Library/Application Support/agent-mac-awake/bin/agent-awake</string>
+    <string>start-foreground</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/REPLACE_ME/Library/Application Support/agent-mac-awake/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/REPLACE_ME/Library/Application Support/agent-mac-awake/launchd.err.log</string>
+</dict>
+</plist>

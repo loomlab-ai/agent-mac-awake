@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+# agent-awake — keep macOS awake for long Cursor / Grok Bot agent runs
+# MIT © 2026 LofiSu
+set -euo pipefail
+
+readonly APP_NAME="agent-mac-awake"
+readonly LABEL="com.lofisu.agent-awake"
+readonly SUPPORT_DIR="${HOME}/Library/Application Support/${APP_NAME}"
+readonly BIN_DIR="${SUPPORT_DIR}/bin"
+readonly INSTALLED_BIN="${BIN_DIR}/agent-awake"
+readonly PID_FILE="${SUPPORT_DIR}/caffeinate.pid"
+readonly STATUS_FILE="${SUPPORT_DIR}/status.json"
+readonly PLIST_DEST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
+readonly CAFFEINATE="/usr/bin/caffeinate"
+# -d prevent display sleep, -i idle sleep, -m disk sleep, -s system sleep (AC), -u user active
+readonly CAFFEINATE_FLAGS="-dimsu"
+
+usage() {
+  cat <<'USAGE'
+agent-awake — keep Mac awake for long AI agent runs
+
+Usage:
+  agent-awake <command> [options]
+
+Commands:
+  start              Start caffeinate in background
+  start-foreground   Run caffeinate in foreground (for launchd)
+  stop               Stop background caffeinate
+  status             Show running state, PID, LaunchAgent
+  install            Install CLI + LaunchAgent (KeepAlive)
+  uninstall [--purge]  Unload LaunchAgent; --purge also deletes support dir
+  enable-lid-guard   Print / optionally apply pmset lid-sleep helpers
+  disable-lid-guard  Restore default sleep (pmset)
+  help               Show this help
+
+Environment:
+  AGENT_AWAKE_I_UNDERSTAND=1   Required to actually run sudo pmset changes
+
+Lid note: closing a MacBook lid often forces sleep. caffeinate alone may not
+survive lid close. See README for AC + pmset / clamshell options.
+USAGE
+}
+
+log_err() {
+  printf '%s\n' "$*" >&2
+}
+
+ensure_support_dir() {
+  mkdir -p "${SUPPORT_DIR}"
+}
+
+is_pid_running() {
+  local pid="$1"
+  [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null
+}
+
+read_pid() {
+  if [[ -f "${PID_FILE}" ]]; then
+    tr -d '[:space:]' <"${PID_FILE}" || true
+  fi
+}
+
+write_status() {
+  local pid="$1"
+  local state="$2"
+  local started_at="${3:-}"
+  ensure_support_dir
+  cat >"${STATUS_FILE}" <<JSON
+{
+  "state": "${state}",
+  "pid": ${pid:-null},
+  "started_at": "${started_at}",
+  "flags": "${CAFFEINATE_FLAGS}",
+  "updated_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date)"
+}
+JSON
+}
+
+launchagent_loaded() {
+  if launchctl print "gui/$(id -u)/${LABEL}" &>/dev/null; then
+    return 0
+  fi
+  if launchctl list 2>/dev/null | grep -q "${LABEL}"; then
+    return 0
+  fi
+  return 1
+}
+
+cmd_start_foreground() {
+  if [[ ! -x "${CAFFEINATE}" ]]; then
+    log_err "error: ${CAFFEINATE} not found (macOS only)"
+    exit 1
+  fi
+  ensure_support_dir
+  # Record our eventual caffeinate child via exec — launchd tracks this process.
+  # Write a marker so status knows LaunchAgent path is active.
+  printf '%s\n' "$$" >"${PID_FILE}"
+  write_status "$$" "foreground" "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date)"
+  exec "${CAFFEINATE}" ${CAFFEINATE_FLAGS}
+}
+
+cmd_start() {
+  if [[ ! -x "${CAFFEINATE}" ]]; then
+    log_err "error: ${CAFFEINATE} not found (this tool is for macOS)"
+    exit 1
+  fi
+
+  local existing
+  existing="$(read_pid)"
+  if is_pid_running "${existing:-}"; then
+    printf 'already running (pid %s)\n' "${existing}"
+    exit 0
+  fi
+
+  # If LaunchAgent is loaded, prefer letting it supervise
+  if launchagent_loaded; then
+    printf 'LaunchAgent %s is loaded — kickstarting\n' "${LABEL}"
+    if launchctl kickstart -k "gui/$(id -u)/${LABEL}" 2>/dev/null; then
+      sleep 0.5
+      cmd_status
+      return 0
+    fi
+    # fall through to manual start if kickstart fails
+  fi
+
+  ensure_support_dir
+  # shellcheck disable=SC2086
+  "${CAFFEINATE}" ${CAFFEINATE_FLAGS} &
+  local pid=$!
+  printf '%s\n' "${pid}" >"${PID_FILE}"
+  write_status "${pid}" "running" "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date)"
+  sleep 0.2
+  if ! is_pid_running "${pid}"; then
+    log_err "error: caffeinate exited immediately"
+    rm -f "${PID_FILE}"
+    write_status "null" "stopped" ""
+    exit 1
+  fi
+  printf 'started caffeinate (pid %s, flags %s)\n' "${pid}" "${CAFFEINATE_FLAGS}"
+}
+
+cmd_stop() {
+  local pid
+  pid="$(read_pid)"
+  local stopped=0
+
+  if is_pid_running "${pid:-}"; then
+    if kill "${pid}" 2>/dev/null; then
+      # give it a moment; escalate if needed
+      sleep 0.3
+      if is_pid_running "${pid}"; then
+        kill -9 "${pid}" 2>/dev/null || true
+      fi
+      stopped=1
+      printf 'stopped caffeinate (pid %s)\n' "${pid}"
+    else
+      log_err "warning: could not signal pid ${pid}"
+    fi
+  else
+    # Also try to stop via launchd if loaded (bootout would uninstall; just stop process)
+    if launchagent_loaded; then
+      if launchctl kill SIGTERM "gui/$(id -u)/${LABEL}" 2>/dev/null; then
+        stopped=1
+        printf 'signaled LaunchAgent %s to stop (KeepAlive may restart it)\n' "${LABEL}"
+        printf 'tip: run `agent-awake uninstall` to fully disable auto-restart\n'
+      fi
+    fi
+    if [[ "${stopped}" -eq 0 ]]; then
+      printf 'not running\n'
+    fi
+  fi
+
+  rm -f "${PID_FILE}"
+  write_status "null" "stopped" ""
+}
+
+uptime_for_pid() {
+  local pid="$1"
+  if [[ ! -n "${pid}" ]]; then
+    return
+  fi
+  # macOS: ps etime
+  ps -p "${pid}" -o etime= 2>/dev/null | tr -d ' ' || true
+}
+
+cmd_status() {
+  local pid
+  pid="$(read_pid)"
+  local running="no"
+  local uptime=""
+
+  if is_pid_running "${pid:-}"; then
+    running="yes"
+    uptime="$(uptime_for_pid "${pid}")"
+  else
+    # Detect orphan caffeinate started by us via LaunchAgent
+    if launchagent_loaded; then
+      local lp
+      lp="$(launchctl print "gui/$(id -u)/${LABEL}" 2>/dev/null | awk '/pid = / {print $3; exit}' || true)"
+      if is_pid_running "${lp:-}"; then
+        pid="${lp}"
+        running="yes"
+        uptime="$(uptime_for_pid "${pid}")"
+      fi
+    fi
+  fi
+
+  local la="no"
+  if launchagent_loaded; then
+    la="yes"
+  fi
+
+  printf 'agent-awake status\n'
+  printf '  caffeinate:     %s\n' "${running}"
+  if [[ "${running}" == "yes" ]]; then
+    printf '  pid:            %s\n' "${pid}"
+    if [[ -n "${uptime}" ]]; then
+      printf '  uptime:         %s\n' "${uptime}"
+    fi
+  fi
+  printf '  flags:          %s\n' "${CAFFEINATE_FLAGS}"
+  printf '  LaunchAgent:    %s (%s)\n' "${la}" "${LABEL}"
+  printf '  support dir:    %s\n' "${SUPPORT_DIR}"
+  if [[ -f "${STATUS_FILE}" ]]; then
+    printf '  status file:    %s\n' "${STATUS_FILE}"
+  fi
+}
+
+plist_template() {
+  local program="$1"
+  cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${program}</string>
+    <string>start-foreground</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>${SUPPORT_DIR}/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>${SUPPORT_DIR}/launchd.err.log</string>
+</dict>
+</plist>
+PLIST
+}
+
+cmd_install() {
+  ensure_support_dir
+  mkdir -p "${BIN_DIR}"
+  mkdir -p "${HOME}/Library/LaunchAgents"
+
+  local source_script
+  source_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+  # Prefer copying from this script; if already installed path, re-copy self
+  if [[ -f "${source_script}" ]]; then
+    cp "${source_script}" "${INSTALLED_BIN}"
+  else
+    log_err "error: cannot locate agent-awake script to install"
+    exit 1
+  fi
+  chmod 755 "${INSTALLED_BIN}"
+
+  plist_template "${INSTALLED_BIN}" >"${PLIST_DEST}"
+  chmod 644 "${PLIST_DEST}"
+
+  # Modern macOS: bootstrap; fallback to load -w
+  local uid
+  uid="$(id -u)"
+  if launchctl bootout "gui/${uid}/${LABEL}" 2>/dev/null; then
+    :
+  else
+    launchctl unload -w "${PLIST_DEST}" 2>/dev/null || true
+  fi
+
+  if launchctl bootstrap "gui/${uid}" "${PLIST_DEST}" 2>/dev/null; then
+    launchctl enable "gui/${uid}/${LABEL}" 2>/dev/null || true
+    launchctl kickstart -k "gui/${uid}/${LABEL}" 2>/dev/null || true
+    printf 'installed + bootstrapped LaunchAgent %s\n' "${LABEL}"
+  elif launchctl load -w "${PLIST_DEST}" 2>/dev/null; then
+    printf 'installed + loaded LaunchAgent %s (legacy load)\n' "${LABEL}"
+  else
+    log_err "error: failed to load LaunchAgent. Plist written to:"
+    log_err "  ${PLIST_DEST}"
+    log_err "Try manually:"
+    log_err "  launchctl bootstrap gui/\$(id -u) ${PLIST_DEST}"
+    exit 1
+  fi
+
+  printf 'CLI: %s\n' "${INSTALLED_BIN}"
+  printf 'Add to PATH (optional):\n'
+  printf '  export PATH="%s:\$PATH"\n' "${BIN_DIR}"
+  cmd_status
+}
+
+cmd_uninstall() {
+  local purge=0
+  if [[ "${1:-}" == "--purge" ]]; then
+    purge=1
+  fi
+
+  local uid
+  uid="$(id -u)"
+
+  if [[ -f "${PLIST_DEST}" ]]; then
+    if launchctl bootout "gui/${uid}/${LABEL}" 2>/dev/null; then
+      printf 'bootout %s\n' "${LABEL}"
+    elif launchctl unload -w "${PLIST_DEST}" 2>/dev/null; then
+      printf 'unloaded %s\n' "${LABEL}"
+    else
+      log_err "warning: could not unload LaunchAgent (may already be unloaded)"
+    fi
+    rm -f "${PLIST_DEST}"
+    printf 'removed %s\n' "${PLIST_DEST}"
+  else
+    printf 'no LaunchAgent plist at %s\n' "${PLIST_DEST}"
+  fi
+
+  # Stop any background caffeinate we tracked
+  local pid
+  pid="$(read_pid)"
+  if is_pid_running "${pid:-}"; then
+    kill "${pid}" 2>/dev/null || true
+    sleep 0.2
+    kill -9 "${pid}" 2>/dev/null || true
+    printf 'stopped caffeinate pid %s\n' "${pid}"
+  fi
+  rm -f "${PID_FILE}"
+
+  if [[ "${purge}" -eq 1 ]]; then
+    if [[ -d "${SUPPORT_DIR}" ]]; then
+      rm -rf "${SUPPORT_DIR}"
+      printf 'purged %s\n' "${SUPPORT_DIR}"
+    fi
+  else
+    printf 'support dir kept: %s (use --purge to delete)\n' "${SUPPORT_DIR}"
+  fi
+}
+
+print_lid_guard_docs() {
+  cat <<'LID'
+Lid-close reality check (MacBook)
+---------------------------------
+• Closing the lid usually forces sleep. `caffeinate -dimsu` alone often does NOT
+  keep the machine awake with the lid shut.
+• Practical options:
+  1) Leave lid open (or use a book-stand) during long agent runs — simplest.
+  2) Clamshell mode: connect power + external display (+ often keyboard/mouse),
+     then close lid — Mac stays awake as a desktop.
+  3) Advanced (battery risk): disable sleep assertions system-wide:
+       sudo pmset -a disablesleep 1
+     Revert with:
+       sudo pmset -a disablesleep 0
+     WARNING: heat + battery drain if left on AC or especially on battery.
+• This tool will NOT silently sudo. Set AGENT_AWAKE_I_UNDERSTAND=1 to apply.
+
+合盖说明（MacBook）
+------------------
+• 合盖通常仍会睡眠；仅靠 caffeinate 往往挡不住合盖休眠。
+• 实用做法：长时间跑 Agent 时开盖；或接电源+外接屏进「开盖模式/蛤壳模式」；
+  或（有风险）sudo pmset -a disablesleep 1，用完务必改回 0。
+LID
+}
+
+cmd_enable_lid_guard() {
+  print_lid_guard_docs
+  printf '\n'
+  if [[ "${AGENT_AWAKE_I_UNDERSTAND:-}" != "1" ]]; then
+    printf 'Dry-run only. To apply, re-run with:\n'
+    printf '  AGENT_AWAKE_I_UNDERSTAND=1 agent-awake enable-lid-guard\n'
+    printf '\nExact command that would run:\n'
+    printf '  sudo pmset -a disablesleep 1\n'
+    exit 0
+  fi
+  if ! command -v pmset >/dev/null 2>&1; then
+    log_err "error: pmset not found"
+    exit 1
+  fi
+  if [[ "$(id -u)" -eq 0 ]]; then
+    pmset -a disablesleep 1
+  else
+    if ! sudo pmset -a disablesleep 1; then
+      log_err "error: sudo pmset failed — run manually:"
+      log_err "  sudo pmset -a disablesleep 1"
+      exit 1
+    fi
+  fi
+  printf 'applied: pmset -a disablesleep 1\n'
+  printf 'REMINDER: revert with agent-awake disable-lid-guard when done.\n'
+}
+
+cmd_disable_lid_guard() {
+  if [[ "${AGENT_AWAKE_I_UNDERSTAND:-}" != "1" ]]; then
+    printf 'Dry-run. To restore default sleep behavior:\n'
+    printf '  AGENT_AWAKE_I_UNDERSTAND=1 agent-awake disable-lid-guard\n'
+    printf '\nExact command:\n'
+    printf '  sudo pmset -a disablesleep 0\n'
+    exit 0
+  fi
+  if ! command -v pmset >/dev/null 2>&1; then
+    log_err "error: pmset not found"
+    exit 1
+  fi
+  if [[ "$(id -u)" -eq 0 ]]; then
+    pmset -a disablesleep 0
+  else
+    if ! sudo pmset -a disablesleep 0; then
+      log_err "error: sudo pmset failed — run manually:"
+      log_err "  sudo pmset -a disablesleep 0"
+      exit 1
+    fi
+  fi
+  printf 'restored: pmset -a disablesleep 0\n'
+}
+
+main() {
+  local cmd="${1:-}"
+  if [[ -z "${cmd}" ]]; then
+    usage
+    exit 1
+  fi
+  shift || true
+  case "${cmd}" in
+    start) cmd_start "$@" ;;
+    start-foreground) cmd_start_foreground "$@" ;;
+    stop) cmd_stop "$@" ;;
+    status) cmd_status "$@" ;;
+    install) cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    enable-lid-guard) cmd_enable_lid_guard "$@" ;;
+    disable-lid-guard) cmd_disable_lid_guard "$@" ;;
+    help|-h|--help) usage ;;
+    *)
+      log_err "error: unknown command: ${cmd}"
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
