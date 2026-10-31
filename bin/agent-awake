@@ -96,7 +96,7 @@ cmd_start_foreground() {
   # Write a marker so status knows LaunchAgent path is active.
   printf '%s\n' "$$" >"${PID_FILE}"
   write_status "$$" "foreground" "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date)"
-  exec "${CAFFEINATE}" ${CAFFEINATE_FLAGS}
+  exec "${CAFFEINATE}" "${CAFFEINATE_FLAGS}"
 }
 
 cmd_start() {
@@ -124,8 +124,7 @@ cmd_start() {
   fi
 
   ensure_support_dir
-  # shellcheck disable=SC2086
-  "${CAFFEINATE}" ${CAFFEINATE_FLAGS} &
+  "${CAFFEINATE}" "${CAFFEINATE_FLAGS}" &
   local pid=$!
   printf '%s\n' "${pid}" >"${PID_FILE}"
   write_status "${pid}" "running" "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date)"
@@ -162,7 +161,7 @@ cmd_stop() {
       if launchctl kill SIGTERM "gui/$(id -u)/${LABEL}" 2>/dev/null; then
         stopped=1
         printf 'signaled LaunchAgent %s to stop (KeepAlive may restart it)\n' "${LABEL}"
-        printf 'tip: run `agent-awake uninstall` to fully disable auto-restart\n'
+        printf '%s\n' "tip: run 'agent-awake uninstall' to fully disable auto-restart"
       fi
     fi
     if [[ "${stopped}" -eq 0 ]]; then
@@ -176,7 +175,7 @@ cmd_stop() {
 
 uptime_for_pid() {
   local pid="$1"
-  if [[ ! -n "${pid}" ]]; then
+  if [[ -z "${pid}" ]]; then
     return
   fi
   # macOS: ps etime
@@ -300,7 +299,7 @@ cmd_install() {
 
   printf 'CLI: %s\n' "${INSTALLED_BIN}"
   printf 'Add to PATH (optional):\n'
-  printf '  export PATH="%s:\$PATH"\n' "${BIN_DIR}"
+  printf '  export PATH="%s:%s"\n' "${BIN_DIR}" "\$PATH"
   cmd_status
 }
 
