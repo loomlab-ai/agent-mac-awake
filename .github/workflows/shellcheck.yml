@@ -1,0 +1,36 @@
+name: shell
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(grep -lE '^#!.*(bash|sh)([[:space:]]|$)' bin/* scripts/*)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "no shell scripts found" >&2
+            exit 1
+          fi
+          printf 'checking:\n'
+          printf '  %s\n' "${files[@]}"
+          if command -v shellcheck >/dev/null 2>&1; then
+            echo "using shellcheck $(shellcheck --version | awk '/^version:/ { print $2 }')"
+            shellcheck "${files[@]}"
+          else
+            echo "shellcheck unavailable; using bash -n"
+            for f in "${files[@]}"; do
+              bash -n "${f}"
+            done
+          fi
