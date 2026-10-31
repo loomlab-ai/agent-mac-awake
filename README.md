@@ -104,7 +104,7 @@ launchctl load -w "$HOME/Library/LaunchAgents/com.lofisu.agent-awake.plist"
 ./scripts/uninstall.sh --purge
 ```
 
-`caffeinate -dimsu` often does not keep a MacBook awake with the lid shut. Clamshell use still often sleeps. A closed lid usually stays awake only with AC power, an external display, and typically a keyboard and mouse. This repo does not configure clamshell mode. For long agent runs, leave the lid open.
+On a MacBook, lid-close sleep is separate from idle sleep, and `caffeinate -dimsu` often does not keep the machine awake with the lid shut. Clamshell use still often sleeps. A closed lid usually stays awake only with AC power, an external display, and typically a keyboard and mouse. This repo does not configure clamshell mode. For long agent runs, leave the lid open.
 
 ```bash
 AGENT_AWAKE_I_UNDERSTAND=1 agent-awake enable-lid-guard
@@ -134,20 +134,6 @@ Install does not change `pmset`. There is no config file.
 | `-u` | Declare the user active |
 
 `-s` applies while the Mac is on AC power. `sudo pmset -a disablesleep 1` can heat the machine and drain the battery. The lid-guard commands print that line and exit unless `AGENT_AWAKE_I_UNDERSTAND=1`.
-
-## FAQ
-
-### Does closing the MacBook lid keep it awake?
-
-Closing the lid still often forces sleep. On a MacBook, lid-close sleep is separate from idle sleep, and `caffeinate -dimsu` frequently does not keep the machine awake with the lid shut. Leave the lid open for long agent runs. Clamshell mode usually needs AC power, an external display, and typically a keyboard and mouse. agent-mac-awake does not configure clamshell mode.
-
-### Why does agent-awake start again after stop?
-
-The LaunchAgent has `KeepAlive`. `agent-awake stop` can end the current process, and launchd starts it again. Unload the agent to pause it (`launchctl bootout`), or run `./scripts/uninstall.sh` to remove it.
-
-### Does agent-mac-awake phone home or change sleep settings?
-
-No network calls and no telemetry. PID and status files stay under `~/Library/Application Support/agent-mac-awake/`. Install does not run `pmset`. `enable-lid-guard` prints `sudo pmset -a disablesleep 1` and runs it only when `AGENT_AWAKE_I_UNDERSTAND=1`.
 
 ## License
 
